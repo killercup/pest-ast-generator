@@ -6,7 +6,7 @@ macro_rules! test {
         fn $name() {
             crate::utils::compile(stringify!($name), $grammar).unwrap();
         }
-    }
+    };
 }
 
 pub fn compile(name: &str, grammar: &str) -> Result<(), Box<dyn std::error::Error>> {

@@ -2,6 +2,7 @@
 
 pub use self::error::Error;
 use heck::{CamelCase, SnakeCase};
+use itertools::Itertools;
 use pest_meta::{
     ast::{Expr, Rule, RuleType},
     parser::{self, consume_rules, parse},
@@ -20,7 +21,7 @@ pub fn grammar_to_rust(name: &str, grammar: &str) -> Result<TokenStream, Error> 
     let rules_as_types = ast
         .into_iter()
         .filter(|rule| rule.ty != RuleType::Silent)
-        .map(rule_to_rust)
+        .map(rule_to_rust_structure)
         .collect::<Result<TokenStream, Error>>()?;
 
     Ok(quote! {
@@ -36,42 +37,38 @@ pub fn grammar_to_rust(name: &str, grammar: &str) -> Result<TokenStream, Error> 
     })
 }
 
-fn rule_to_rust(rule: Rule) -> Result<TokenStream, Error> {
+fn rule_to_rust_structure(rule: Rule) -> Result<TokenStream, Error> {
     use ast_helpers::*;
 
-    let name = ident(&rule.name)?;
+    let rule_type = ident("Rule")?;
+    let rule_name = ident(&rule.name)?;
     let type_name = ident(&rule.name.to_camel_case())?;
 
     Ok(match rule.expr {
-        Expr::Str(..) | Expr::Insens(..) => {
-            let impl_from_pest = impl_from_pest_for_unit_struct(&type_name, ident("Rule")?, name);
-
-            quote! {
-                #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-                pub struct #type_name<'src> {
-                    marker: core::marker::PhantomData<&'src str>,
-                }
-
-                #impl_from_pest
-            }
-        }
+        Expr::Str(..) | Expr::Insens(..) => unit_struct(type_name, rule_type, rule_name),
         Expr::Seq(a, b) => {
             let props: Vec<_> = flatten_seq(*a)
                 .chain(flatten_seq(*b))
-                .enumerate()
-                .filter_map(|(_idx, expr)| match expr {
-                    Expr::Ident(s) => {
-                        let name = ident(&s.to_snake_case()).unwrap();
-                        let type_name = ident(&s.to_camel_case()).unwrap();
-                        Some(quote! { #name: #type_name <'src> })
-                    }
-                    _ => None,
+                .filter(|x| match x {
+                    Expr::Str(..) | Expr::Insens(..) => false,
+                    _ => true,
                 })
-                .collect::<Vec<TokenStream>>();
+                .enumerate()
+                .map(|(idx, expr)| match expr_to_rust_type_spec(expr) {
+                    Ok((Some(field_name), def)) => Ok((field_name, def)),
+                    Ok((None, def)) => Ok((ident(&format!("_{}", idx))?, def)),
+                    Err(e) => Err(e),
+                })
+                .map_results(|(prop_name, typ)| quote! { #prop_name: #typ })
+                .collect::<Result<Vec<TokenStream>, Error>>()?;
+
+            if props.is_empty() {
+                return Ok(consume_struct(type_name, rule_type, rule_name));
+            }
 
             quote! {
                 #[derive(Debug, Clone, PartialEq, Eq, pest_ast::FromPest)]
-                #[pest_ast(rule(Rule::#name))]
+                #[pest_ast(rule(Rule::#rule_name))]
                 pub struct #type_name<'src> {
                     #(
                         pub #props ,
@@ -88,9 +85,9 @@ fn rule_to_rust(rule: Rule) -> Result<TokenStream, Error> {
                             Err(Error::Unsupported { description: "Literal in choice" })?
                         }
                         Expr::Ident(s) => {
-                            let name = ident(&s.to_camel_case())?;
+                            let rule_name = ident(&s.to_camel_case())?;
                             let inner = ident(&s.to_camel_case())?;
-                            Ok(quote! { #name ( #inner <'src> ) })
+                            Ok(quote! { #rule_name ( #inner <'src> ) })
                         }
                         _ => Ok(quote! {}),
                     }
@@ -111,9 +108,13 @@ fn rule_to_rust(rule: Rule) -> Result<TokenStream, Error> {
                 Err(Error::CodeGenerationErrors { errors })?
             }
 
+            if variants.is_empty() {
+                return Ok(consume_struct(type_name, rule_type, rule_name));
+            }
+
             quote! {
                 #[derive(Debug, Clone, PartialEq, Eq, pest_ast::FromPest)]
-                #[pest_ast(rule(Rule::#name))]
+                #[pest_ast(rule(#rule_type::#rule_name))]
                 pub enum #type_name<'src> {
                     #(
                         #variants ,
@@ -121,15 +122,47 @@ fn rule_to_rust(rule: Rule) -> Result<TokenStream, Error> {
                 }
             }
         }
-        _ => quote! {
-            #[derive(Debug, Clone, PartialEq, Eq, pest_ast::FromPest)]
-            #[pest_ast(rule(Rule::#name))]
-            pub struct #type_name<'src> {
-                #[pest_ast(outer(with(span_into_str)))]
-                pub content: &'src str,
-            }
-        },
+        _ => consume_struct(type_name, rule_type, rule_name),
     })
+}
+
+fn expr_to_rust_type_spec(expr: Expr) -> Result<(Option<syn::Ident>, TokenStream), Error> {
+    match expr {
+        Expr::Str(..) | Expr::Insens(..) => {
+            Err(Error::Unsupported { description: "Literal as type" })
+        }
+        Expr::Range(..) => Ok((None, quote! { char })),
+        Expr::Ident(s) => {
+            let prop_name = ident(&s.to_snake_case())?;
+            let type_name = ident(&s.to_camel_case())?;
+            Ok((Some(prop_name), quote! { #type_name <'src> }))
+        }
+        Expr::PeekSlice(..)
+        | Expr::PosPred(..)
+        | Expr::NegPred(..)
+        | Expr::Skip(_)
+        | Expr::Push(_) => Err(Error::Unsupported { description: "not a pattern" }),
+        Expr::Seq(..) => Err(Error::Unsupported { description: "seq as type" }),
+        Expr::Choice(..) => Err(Error::Unsupported { description: "choice as type" }),
+        Expr::Opt(x) => {
+            let (prop_name, inner) = expr_to_rust_type_spec(*x)?;
+            Ok((prop_name, quote! { Option<#inner> }))
+        }
+        Expr::Rep(x)
+        | Expr::RepOnce(x)
+        | Expr::RepExact(x, ..)
+        | Expr::RepMin(x, ..)
+        | Expr::RepMax(x, ..)
+        | Expr::RepMinMax(x, ..) => {
+            let (inner_prop_name, inner) = expr_to_rust_type_spec(*x)?;
+            let prop_name = if let Some(n) = inner_prop_name {
+                Some(ident(&format!("{}_items", n.to_string()))?)
+            } else {
+                None
+            };
+            Ok((prop_name, quote! { Vec<#inner> }))
+        }
+    }
 }
 
 fn ident(input: &str) -> Result<syn::Ident, Error> {
@@ -153,6 +186,38 @@ mod error {
         Unsupported { description: &'static str },
         #[snafu(display("Code generation failed: {}", errors.iter().map(Error::to_string).join("\n")))]
         CodeGenerationErrors { errors: Vec<Error> },
+    }
+}
+
+fn consume_struct(
+    type_name: impl ToTokens,
+    rule_type: impl ToTokens,
+    rule_name: impl ToTokens,
+) -> TokenStream {
+    quote! {
+        #[derive(Debug, Clone, PartialEq, Eq, pest_ast::FromPest)]
+        #[pest_ast(rule(#rule_type::#rule_name))]
+        pub struct #type_name<'src> {
+            #[pest_ast(outer(with(span_into_str)))]
+            pub content: &'src str,
+        }
+    }
+}
+
+fn unit_struct(
+    type_name: impl ToTokens,
+    rule_type: syn::Ident,
+    rule_name: impl ToTokens,
+) -> TokenStream {
+    let impl_from_pest = impl_from_pest_for_unit_struct(&type_name, rule_type, rule_name);
+
+    quote! {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct #type_name<'src> {
+            marker: core::marker::PhantomData<&'src str>,
+        }
+
+        #impl_from_pest
     }
 }
 
