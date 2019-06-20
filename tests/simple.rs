@@ -1,7 +1,9 @@
 #[test]
 fn simple1() {
     let grammar = r#"
-        foo = { "a" | "b" | c }
+        foo = { a | b | c }
+        a = { "a" }
+        b = { "b" }
         c = { "foo" ~ integer ~ "bar" }
         integer = @{ (ASCII_DIGIT){1,10} }
     "#;

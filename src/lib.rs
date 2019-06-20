@@ -1,5 +1,5 @@
 pub use self::error::Error;
-use heck::CamelCase;
+use heck::{CamelCase, SnakeCase};
 use pest_meta::{
     ast::{Expr, Rule, RuleType},
     parser::{self, consume_rules, parse},
@@ -7,6 +7,8 @@ use pest_meta::{
 use proc_macro2::TokenStream;
 use quote::quote;
 use snafu::ResultExt;
+
+mod ast_helpers;
 
 pub fn grammar_to_rust(grammar: &str) -> Result<TokenStream, Error> {
     let tokens = parse(parser::Rule::grammar_rules, grammar).context(error::ParseGrammar)?;
@@ -28,21 +30,86 @@ pub fn grammar_to_rust(grammar: &str) -> Result<TokenStream, Error> {
 }
 
 fn rule_to_rust(rule: Rule) -> Result<TokenStream, Error> {
-    let name = &rule.name;
-    let type_name: syn::Ident = syn::parse_str(&rule.name.to_camel_case()).with_context(|| {
-        error::SynError { target: "type name".to_string(), token: rule.name.to_string() }
-    })?;
+    use ast_helpers::*;
+
+    let name = ident(&rule.name)?;
+    let type_name = ident(&rule.name.to_camel_case())?;
 
     Ok(match rule.expr {
+        Expr::Str(..) | Expr::Insens(..) => {
+            quote! {
+                #[derive(Debug, Clone, Copy, PartialEq, Eq, FromPest)]
+                #[pest_ast(rule(Rule::#name))]
+                pub struct #type_name<'src> {
+                    marker: core::marker::PhantomData<&'src str>,
+                }
+            }
+        }
         Expr::Seq(a, b) => {
-            let seq: Vec<_> = flatten_seq(*a).chain(flatten_seq(*b)).collect();
-            dbg!(seq);
-            quote! {}
+            let props: Vec<_> = flatten_seq(*a)
+                .chain(flatten_seq(*b))
+                .enumerate()
+                .filter_map(|(_idx, expr)| match expr {
+                    Expr::Ident(s) => {
+                        let name = ident(&s.to_snake_case()).unwrap();
+                        let type_name = ident(&s.to_camel_case()).unwrap();
+                        Some(quote! { #name: #type_name <'src> })
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<TokenStream>>();
+
+            quote! {
+                #[derive(Debug, Clone, PartialEq, Eq, FromPest)]
+                #[pest_ast(rule(Rule::#name))]
+                pub struct #type_name<'src> {
+                    #(
+                        pub #props ,
+                    )*
+                }
+            }
         }
         Expr::Choice(a, b) => {
-            let alternates: Vec<_> = flatten_choices(*a).chain(flatten_choices(*b)).collect();
-            dbg!(alternates);
-            quote! {}
+            let (variants, errors) = flatten_choices(*a)
+                .chain(flatten_choices(*b))
+                .map(|expr: Expr| -> Result<_, Error> {
+                    match expr {
+                        Expr::Str(..) | Expr::Insens(..) => {
+                            Err(Error::Unsupported { description: "Literal in choice" })?
+                        }
+                        Expr::Ident(s) => {
+                            let name = ident(&s.to_camel_case())?;
+                            let inner = ident(&s.to_camel_case())?;
+                            Ok(quote! { #name ( #inner <'src> ) })
+                        }
+                        _ => Ok(quote! {}),
+                    }
+                })
+                .fold((vec![], vec![]), |(mut oks, mut errs), res| {
+                    match res {
+                        Ok(x) => {
+                            if !x.is_empty() {
+                                oks.push(x);
+                            }
+                        }
+                        Err(e) => errs.push(e),
+                    };
+                    (oks, errs)
+                });
+
+            if !errors.is_empty() {
+                Err(Error::CodeGenerationErrors { errors })?
+            }
+
+            quote! {
+                #[derive(Debug, Clone, PartialEq, Eq, FromPest)]
+                #[pest_ast(rule(Rule::#name))]
+                pub enum #type_name<'src> {
+                    #(
+                        #variants ,
+                    )*
+                }
+            }
         }
         _ => quote! {
             #[derive(Debug, Clone, PartialEq, Eq, FromPest)]
@@ -55,21 +122,12 @@ fn rule_to_rust(rule: Rule) -> Result<TokenStream, Error> {
     })
 }
 
-fn flatten_choices(expr: Expr) -> Box<dyn Iterator<Item = Expr>> {
-    match expr {
-        Expr::Choice(a, b) => Box::new(flatten_choices(*a).chain(flatten_choices(*b))),
-        x => Box::new(std::iter::once(x)),
-    }
-}
-
-fn flatten_seq(expr: Expr) -> Box<dyn Iterator<Item = Expr>> {
-    match expr {
-        Expr::Seq(a, b) => Box::new(flatten_seq(*a).chain(flatten_seq(*b))),
-        x => Box::new(std::iter::once(x)),
-    }
+fn ident(input: &str) -> Result<syn::Ident, Error> {
+    syn::parse_str(input).with_context(|| error::SynError { token: input.to_owned() })
 }
 
 mod error {
+    use itertools::Itertools;
     use snafu::Snafu;
 
     #[derive(Debug, Snafu)]
@@ -79,12 +137,11 @@ mod error {
         ParseGrammar { source: pest::error::Error<pest_meta::parser::Rule> },
         #[snafu(display("Could not read grammar, errors: {:#?}", errors))]
         ReadGrammar { errors: Vec<pest::error::Error<pest_meta::parser::Rule>> },
-        #[snafu(display(
-            "While trying to build {} you've synned at `{}`: {}",
-            target,
-            token,
-            source
-        ))]
-        SynError { token: String, target: String, source: syn::Error },
+        #[snafu(display("Syn error at `{}`: {}", token, source))]
+        SynError { token: String, source: syn::Error },
+        #[snafu(display("Unsupported: {}", description))]
+        Unsupported { description: &'static str },
+        #[snafu(display("Code generation failed: {}", errors.iter().map(Error::to_string).join("\n")))]
+        CodeGenerationErrors { errors: Vec<Error> },
     }
 }
