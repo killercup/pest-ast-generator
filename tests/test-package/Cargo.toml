@@ -1,0 +1,11 @@
+[package]
+name = "test-package"
+version = "0.1.0"
+authors = ["Pascal Hertleif <pascal@technocreatives.com>"]
+edition = "2018"
+
+[dependencies]
+pest = "2.1.1"
+pest_derive = "2.1.0"
+pest-ast = { version = "0.3.3", git = "https://github.com/killercup/ast/", branch = "dont-panic" }
+from-pest = { version = "0.3.1", git = "https://github.com/killercup/ast/", branch = "dont-panic" }
