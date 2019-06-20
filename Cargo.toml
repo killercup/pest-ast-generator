@@ -3,6 +3,9 @@ name = "pest_ast_generator"
 version = "0.1.0"
 authors = ["Pascal Hertleif <pascal@technocreatives.com>"]
 edition = "2018"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/killercup/pest-ast-generator"
+readme = "README.md"
 
 [dependencies]
 pest_meta = "2.1.1"
