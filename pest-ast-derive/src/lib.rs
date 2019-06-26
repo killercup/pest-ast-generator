@@ -11,9 +11,9 @@ use syn::{Attribute, DeriveInput, Generics, Ident, Lit, Meta};
 #[proc_macro_derive(ParserAst, attributes(grammar, grammar_inline))]
 pub fn derive_parser(input: TokenStream) -> TokenStream {
     let ast: DeriveInput = syn::parse(input).unwrap();
-    let (name, generics, content) = parse_derive(ast);
+    let (name, _generics, content) = parse_derive(ast);
 
-    let (data, path) = match content {
+    let (data, _path) = match content {
         GrammarSource::File(ref path) => {
             let root = env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
             let path = Path::new(&root).join("src/").join(&path);

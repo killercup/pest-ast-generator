@@ -77,48 +77,57 @@ fn rule_to_rust_structure(rule: Rule) -> Result<TokenStream, Error> {
             }
         }
         Expr::Choice(a, b) => {
-            let (variants, errors) = flatten_choices(*a)
-                .chain(flatten_choices(*b))
-                .map(|expr: Expr| -> Result<_, Error> {
-                    match expr {
-                        Expr::Str(s) | Expr::Insens(s) => {
-                            Err(Error::Unsupported { description: format!("Literal `{}` in choice", s) })?
-                        }
-                        Expr::Ident(s) => {
-                            let rule_name = ident(&s.to_camel_case())?;
-                            let inner = ident(&s.to_camel_case())?;
-                            Ok(quote! { #rule_name ( #inner <'src> ) })
-                        }
-                        _ => Ok(quote! {}),
-                    }
-                })
-                .fold((vec![], vec![]), |(mut oks, mut errs), res| {
-                    match res {
-                        Ok(x) => {
-                            if !x.is_empty() {
-                                oks.push(x);
+            let choices: Vec<Expr> = flatten_choices(*a).chain(flatten_choices(*b)).collect();
+            let all_strings = choices.iter().all(|expr| match expr {
+                Expr::Str(..) | Expr::Insens(..) => true,
+                _ => false,
+            });
+            if all_strings {
+                simple_enum(type_name, rule_type, rule_name, choices.into_iter())
+            } else {
+                let (variants, errors) = choices
+                    .into_iter()
+                    .map(|expr: Expr| -> Result<_, Error> {
+                        match expr {
+                            Expr::Str(s) | Expr::Insens(s) => Err(Error::Unsupported {
+                                description: format!("Literal `{}` in choice", s),
+                            })?,
+                            Expr::Ident(s) => {
+                                let rule_name = ident(&s.to_camel_case())?;
+                                let inner = ident(&s.to_camel_case())?;
+                                Ok(quote! { #rule_name ( #inner <'src> ) })
                             }
+                            _ => Ok(quote! {}),
                         }
-                        Err(e) => errs.push(e),
-                    };
-                    (oks, errs)
-                });
+                    })
+                    .fold((vec![], vec![]), |(mut oks, mut errs), res| {
+                        match res {
+                            Ok(x) => {
+                                if !x.is_empty() {
+                                    oks.push(x);
+                                }
+                            }
+                            Err(e) => errs.push(e),
+                        };
+                        (oks, errs)
+                    });
 
-            if !errors.is_empty() {
-                Err(Error::CodeGenerationErrors { errors })?
-            }
+                if !errors.is_empty() {
+                    Err(Error::CodeGenerationErrors { errors })?
+                }
 
-            if variants.is_empty() {
-                return Ok(consume_struct(type_name, rule_type, rule_name));
-            }
+                if variants.is_empty() {
+                    return Ok(consume_struct(type_name, rule_type, rule_name));
+                }
 
-            quote! {
-                #[derive(Debug, Clone, PartialEq, Eq, pest_ast::FromPest)]
-                #[pest_ast(rule(#rule_type::#rule_name))]
-                pub enum #type_name<'src> {
-                    #(
-                        #variants ,
-                    )*
+                quote! {
+                    #[derive(Debug, Clone, PartialEq, Eq, pest_ast::FromPest)]
+                    #[pest_ast(rule(#rule_type::#rule_name))]
+                    pub enum #type_name<'src> {
+                        #(
+                            #variants ,
+                        )*
+                    }
                 }
             }
         }
@@ -183,7 +192,7 @@ mod error {
         #[snafu(display("Syn error at `{}`: {}", token, source))]
         SynError { token: String, source: syn::Error },
         #[snafu(display("Unsupported: {}", description))]
-        Unsupported { description: String, },
+        Unsupported { description: String },
         #[snafu(display("Code generation failed: {}", errors.iter().map(Error::to_string).join("\n")))]
         CodeGenerationErrors { errors: Vec<Error> },
     }
@@ -253,5 +262,76 @@ fn impl_from_pest_for_unit_struct(
                 }
             }
         }
+    }
+}
+
+fn simple_enum(
+    type_name: impl ToTokens + Clone,
+    rule_type: impl ToTokens,
+    rule_name: impl ToTokens,
+    choices: impl Iterator<Item = Expr>,
+) -> TokenStream {
+    let variants: Vec<String> = choices
+        .map(|expr| match expr {
+            Expr::Str(s) | Expr::Insens(s) => s,
+            _ => unreachable!(),
+        })
+        .collect();
+
+    let idents = variants.iter().map(|x| ident(&x.to_camel_case()).unwrap());
+    let idents2 = idents.clone();
+
+    let enum_def = quote! {
+        #[derive(Debug, Clone, PartialEq, Eq, pest_ast::FromPest)]
+        #[pest_ast(rule(#rule_type::#rule_name))]
+        pub enum #type_name<'src> {
+            #(
+                #idents2 ,
+            )*
+        }
+    };
+
+    let type_names = std::iter::repeat(type_name.clone()).take(variants.len());
+    let variants2 = variants.clone();
+    let idents2 = idents.clone();
+
+    let from_pest_impl = quote! {
+        impl<'a> ::from_pest::FromPest<'a> for #type_name<'a> {
+            type Rule = #rule_type;
+            type FatalError = ::from_pest::Void;
+
+            fn from_pest(
+                pest: &mut ::from_pest::pest::iterators::Pairs<'a, Self::Rule>,
+            ) -> ::std::result::Result<Self, ::from_pest::ConversionError<::from_pest::Void>>
+            {
+                let mut clone = pest.clone();
+                let pair = clone.next().ok_or(::from_pest::ConversionError::NoMatch)?;
+                if pair.as_rule() == #rule_type :: #rule_name {
+                    let this = match pair.as_str() {
+                        #(
+                            #variants2 => #type_names::#idents2
+                        ),*
+                        _ => Err(::from_pest::ConversionError::Malformed(::from_pest::Void))?,
+                    };
+
+                    let mut inner = pair.into_inner();
+                    let inner = &mut inner;
+                    if inner.clone().next().is_some() {
+                        Err(::from_pest::ConversionError::Extraneous {
+                            current_node: "KeyModeReplace",
+                        })?;
+                    }
+                    *pest = clone;
+                    Ok(this)
+                } else {
+                    Err(::from_pest::ConversionError::NoMatch)
+                }
+            }
+        }
+    };
+
+    quote! {
+        #enum_def
+        #from_pest_impl
     }
 }
