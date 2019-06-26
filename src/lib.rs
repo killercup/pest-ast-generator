@@ -81,8 +81,8 @@ fn rule_to_rust_structure(rule: Rule) -> Result<TokenStream, Error> {
                 .chain(flatten_choices(*b))
                 .map(|expr: Expr| -> Result<_, Error> {
                     match expr {
-                        Expr::Str(..) | Expr::Insens(..) => {
-                            Err(Error::Unsupported { description: "Literal in choice" })?
+                        Expr::Str(s) | Expr::Insens(s) => {
+                            Err(Error::Unsupported { description: format!("Literal `{}` in choice", s) })?
                         }
                         Expr::Ident(s) => {
                             let rule_name = ident(&s.to_camel_case())?;
@@ -128,8 +128,8 @@ fn rule_to_rust_structure(rule: Rule) -> Result<TokenStream, Error> {
 
 fn expr_to_rust_type_spec(expr: Expr) -> Result<(Option<syn::Ident>, TokenStream), Error> {
     match expr {
-        Expr::Str(..) | Expr::Insens(..) => {
-            Err(Error::Unsupported { description: "Literal as type" })
+        Expr::Str(s) | Expr::Insens(s) => {
+            Err(Error::Unsupported { description: format!("Literal `{}` as type", s) })
         }
         Expr::Range(..) => Ok((None, quote! { char })),
         Expr::Ident(s) => {
@@ -141,9 +141,9 @@ fn expr_to_rust_type_spec(expr: Expr) -> Result<(Option<syn::Ident>, TokenStream
         | Expr::PosPred(..)
         | Expr::NegPred(..)
         | Expr::Skip(_)
-        | Expr::Push(_) => Err(Error::Unsupported { description: "not a pattern" }),
-        Expr::Seq(..) => Err(Error::Unsupported { description: "seq as type" }),
-        Expr::Choice(..) => Err(Error::Unsupported { description: "choice as type" }),
+        | Expr::Push(_) => Err(Error::Unsupported { description: "pattern".into() }),
+        Expr::Seq(..) => Err(Error::Unsupported { description: "seq as type".into() }),
+        Expr::Choice(..) => Err(Error::Unsupported { description: "choice as type".into() }),
         Expr::Opt(x) => {
             let (prop_name, inner) = expr_to_rust_type_spec(*x)?;
             Ok((prop_name, quote! { Option<#inner> }))
@@ -183,7 +183,7 @@ mod error {
         #[snafu(display("Syn error at `{}`: {}", token, source))]
         SynError { token: String, source: syn::Error },
         #[snafu(display("Unsupported: {}", description))]
-        Unsupported { description: &'static str },
+        Unsupported { description: String, },
         #[snafu(display("Code generation failed: {}", errors.iter().map(Error::to_string).join("\n")))]
         CodeGenerationErrors { errors: Vec<Error> },
     }
