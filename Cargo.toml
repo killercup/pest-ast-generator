@@ -21,3 +21,9 @@ log = "0.4.6"
 
 [dev-dependencies]
 env_logger = "0.6.1"
+
+[workspace]
+members = [
+    ".",
+    "pest-ast-derive",
+]
