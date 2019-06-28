@@ -12,6 +12,7 @@ use quote::{quote, ToTokens};
 use snafu::ResultExt;
 
 mod ast_helpers;
+use ast_helpers::*;
 
 pub fn grammar_to_rust(name: &str, grammar: &str) -> Result<TokenStream, Error> {
     let parser_type = ident(&name.to_camel_case())?;
@@ -21,6 +22,7 @@ pub fn grammar_to_rust(name: &str, grammar: &str) -> Result<TokenStream, Error> 
     let rules_as_types = ast
         .into_iter()
         .filter(|rule| rule.ty != RuleType::Silent)
+        .filter(|r| is_regular_rule(&r.name))
         .map(rule_to_rust_structure)
         .collect::<Result<TokenStream, Error>>()?;
 
@@ -38,23 +40,17 @@ pub fn grammar_to_rust(name: &str, grammar: &str) -> Result<TokenStream, Error> 
 }
 
 fn rule_to_rust_structure(rule: Rule) -> Result<TokenStream, Error> {
-    use ast_helpers::*;
-
     let rule_type = ident("Rule")?;
     let rule_name = ident(&rule.name)?;
     let type_name = ident(&rule.name.to_camel_case())?;
 
-    Ok(match rule.expr {
+    Ok(match rule.clone().expr {
         Expr::Str(..) | Expr::Insens(..) => unit_struct(type_name, rule_type, rule_name),
         Expr::Seq(a, b) => {
-            let props: Vec<_> = flatten_seq(*a)
-                .chain(flatten_seq(*b))
-                .filter(|x| match x {
-                    Expr::Str(..) | Expr::Insens(..) => false,
-                    _ => true,
-                })
+            let props: Vec<_> = flatten_seqs(*a, *b)
+                .into_iter()
                 .enumerate()
-                .map(|(idx, expr)| match expr_to_rust_type_spec(expr) {
+                .map(|(idx, expr)| match expr_to_rust_type_spec(expr, rule.clone()) {
                     Ok((Some(field_name), def)) => Ok((field_name, def)),
                     Ok((None, def)) => Ok((ident(&format!("_{}", idx))?, def)),
                     Err(e) => Err(e),
@@ -91,6 +87,7 @@ fn rule_to_rust_structure(rule: Rule) -> Result<TokenStream, Error> {
                         match expr {
                             Expr::Str(s) | Expr::Insens(s) => Err(Error::Unsupported {
                                 description: format!("Literal `{}` in choice", s),
+                                rule: rule.clone(),
                             })?,
                             Expr::Ident(s) => {
                                 let rule_name = ident(&s.to_camel_case())?;
@@ -135,10 +132,13 @@ fn rule_to_rust_structure(rule: Rule) -> Result<TokenStream, Error> {
     })
 }
 
-fn expr_to_rust_type_spec(expr: Expr) -> Result<(Option<syn::Ident>, TokenStream), Error> {
+fn expr_to_rust_type_spec(
+    expr: Expr,
+    rule: Rule,
+) -> Result<(Option<syn::Ident>, TokenStream), Error> {
     match expr {
         Expr::Str(s) | Expr::Insens(s) => {
-            Err(Error::Unsupported { description: format!("Literal `{}` as type", s) })
+            Err(Error::Unsupported { description: format!("Literal `{}` as type", s), rule })
         }
         Expr::Range(..) => Ok((None, quote! { char })),
         Expr::Ident(s) => {
@@ -150,11 +150,37 @@ fn expr_to_rust_type_spec(expr: Expr) -> Result<(Option<syn::Ident>, TokenStream
         | Expr::PosPred(..)
         | Expr::NegPred(..)
         | Expr::Skip(_)
-        | Expr::Push(_) => Err(Error::Unsupported { description: "pattern".into() }),
-        Expr::Seq(..) => Err(Error::Unsupported { description: "seq as type".into() }),
-        Expr::Choice(..) => Err(Error::Unsupported { description: "choice as type".into() }),
+        | Expr::Push(_) => Err(Error::Unsupported { description: "pattern".into(), rule }),
+        Expr::Seq(a, b) => {
+            let props: Vec<_> = flatten_seqs(*a, *b);
+
+            fn get_simple_rule(props: &Expr) -> Option<Expr> {
+                match props {
+                    Expr::Ident(s) => return Some(Expr::Ident(s.into())),
+                    Expr::Opt(s) => {
+                        if let Expr::Ident(ref ident) = **s {
+                            if is_regular_rule(&ident) {
+                                return Some(Expr::Ident(ident.into()));
+                            }
+                        }
+                    }
+                    _ => {}
+                };
+                None
+            }
+
+            let simple_props: Vec<Expr> = props.iter().filter_map(get_simple_rule).collect();
+
+            if let [ident] = simple_props.as_slice() {
+                expr_to_rust_type_spec(ident.clone(), rule)
+            } else {
+                eprintln!("seq too complex {:?}", props);
+                Err(Error::Unsupported { description: "complex seq as type".into(), rule })
+            }
+        }
+        Expr::Choice(..) => Err(Error::Unsupported { description: "choice as type".into(), rule }),
         Expr::Opt(x) => {
-            let (prop_name, inner) = expr_to_rust_type_spec(*x)?;
+            let (prop_name, inner) = expr_to_rust_type_spec(*x, rule)?;
             Ok((prop_name, quote! { Option<#inner> }))
         }
         Expr::Rep(x)
@@ -163,7 +189,7 @@ fn expr_to_rust_type_spec(expr: Expr) -> Result<(Option<syn::Ident>, TokenStream
         | Expr::RepMin(x, ..)
         | Expr::RepMax(x, ..)
         | Expr::RepMinMax(x, ..) => {
-            let (inner_prop_name, inner) = expr_to_rust_type_spec(*x)?;
+            let (inner_prop_name, inner) = expr_to_rust_type_spec(*x, rule)?;
             let prop_name = if let Some(n) = inner_prop_name {
                 Some(ident(&format!("{}_items", n.to_string()))?)
             } else {
@@ -178,8 +204,27 @@ fn ident(input: &str) -> Result<syn::Ident, Error> {
     syn::parse_str(input).with_context(|| error::SynError { token: input.to_owned() })
 }
 
+/// Treat UPPERCASE_RULES as special, by which I mean "ignore them".
+///
+/// This makes sure we skip generating AST structs for rules like `WHITESPACE` and `COMMENT`.
+fn is_regular_rule(rule_name: &str) -> bool {
+    !rule_name.chars().all(|c| c.is_uppercase() || c == '_')
+}
+
+fn flatten_seqs(a: Expr, b: Expr) -> Vec<Expr> {
+    flatten_seq(a)
+        .chain(flatten_seq(b))
+        .filter(|x| match x {
+            Expr::Str(..) | Expr::Insens(..) => false,
+            Expr::Ident(s) => is_regular_rule(s),
+            _ => true,
+        })
+        .collect()
+}
+
 mod error {
     use itertools::Itertools;
+    use pest_meta::ast::Rule;
     use snafu::Snafu;
 
     #[derive(Debug, Snafu)]
@@ -191,8 +236,8 @@ mod error {
         ReadGrammar { errors: Vec<pest::error::Error<pest_meta::parser::Rule>> },
         #[snafu(display("Syn error at `{}`: {}", token, source))]
         SynError { token: String, source: syn::Error },
-        #[snafu(display("Unsupported: {}", description))]
-        Unsupported { description: String },
+        #[snafu(display("Unsupported {} (in rule `{}`)", description, rule.name))]
+        Unsupported { description: String, rule: Rule },
         #[snafu(display("Code generation failed: {}", errors.iter().map(Error::to_string).join("\n")))]
         CodeGenerationErrors { errors: Vec<Error> },
     }
