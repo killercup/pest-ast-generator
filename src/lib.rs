@@ -156,11 +156,11 @@ fn expr_to_rust_type_spec(
 
             fn get_simple_rule(props: &Expr) -> Option<Expr> {
                 match props {
-                    Expr::Ident(s) => return Some(Expr::Ident(s.into())),
+                    Expr::Ident(s) => return Some(Expr::Ident(s.to_owned())),
                     Expr::Opt(s) => {
                         if let Expr::Ident(ref ident) = **s {
                             if is_regular_rule(&ident) {
-                                return Some(Expr::Ident(ident.into()));
+                                return Some(Expr::Ident(ident.to_owned()));
                             }
                         }
                     }
